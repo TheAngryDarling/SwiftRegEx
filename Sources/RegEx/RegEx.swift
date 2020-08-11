@@ -8,7 +8,11 @@
 
 import Foundation
 /// An immutable representation of a compiled regular expression that you apply to Unicode strings.
-public class RegEx: NSObject, ExpressibleByStringLiteral {
+public final class RegEx: NSObject, Codable, ExpressibleByStringLiteral {
+    
+    public enum Errors: Error {
+        case parsedInvalidOptionFlags(String)
+    }
     
     /// Parses pattern groups and keeps track of the group number of each.
     /// This is used to find group names
@@ -195,6 +199,35 @@ public class RegEx: NSObject, ExpressibleByStringLiteral {
         public init(rawValue: UInt) { self.rawValue = rawValue }
         internal init(_ value: NSRegularExpression.Options) { rawValue =  value.rawValue}
         
+        
+        private static let FLAG_CONVERSION: [Character: Options] = [
+            "i": .caseInsensitive,
+            "s": .dotMatchesLineSeparators,
+            "m": .anchorsMatchLines,
+            "W": .allowCommentsAndWhitespace,
+            "E": .ignoreMetacharacters,
+            "L": .useUnixLineSeparators,
+            "B": .useUnicodeWordBoundaries,
+        ]
+        
+        /// String representation of flag options
+        public var flagString: String {
+            var rtn: String = ""
+            for k in Options.FLAG_CONVERSION.keys.sorted(by: { return String($0).lowercased() < String($1).lowercased() }) {
+                let v = Options.FLAG_CONVERSION[k]!
+                if self.contains(v) { rtn += String(k) }
+            }
+            return rtn
+        }
+        
+        /// Creation an option based on the character flag representation
+        /// If an invalid character is provided nil will be returned
+        /// - Parameter flag: The character flag for this option
+        public init?(_ flag: Character) {
+            guard let val = Options.FLAG_CONVERSION[flag] else { return nil }
+            self = val
+        }
+        
         /// Match letters in the pattern independent of case.
         public static let caseInsensitive: Options = Options(NSRegularExpression.Options.caseInsensitive)
         
@@ -218,6 +251,15 @@ public class RegEx: NSObject, ExpressibleByStringLiteral {
         
         /// The NSRegularExpression.Options representation of this object
         public var nsValue: NSRegularExpression.Options { return NSRegularExpression.Options(rawValue: self.rawValue) }
+        
+        /// Option set with all conditions
+        public static let all: Options = [.caseInsensitive,
+                                          .allowCommentsAndWhitespace,
+                                          .ignoreMetacharacters,
+                                          .dotMatchesLineSeparators,
+                                          .anchorsMatchLines,
+                                          .useUnixLineSeparators,
+                                          .useUnicodeWordBoundaries]
         
     }
     
@@ -275,6 +317,12 @@ public class RegEx: NSObject, ExpressibleByStringLiteral {
         public var nsValue: NSRegularExpression.MatchingFlags { return NSRegularExpression.MatchingFlags(rawValue: self.rawValue) }
     }
     
+    /// Indicator if we should not throw an error when parsing well documented regular expression flags that are unsupported in Swift like g, u and y
+    /// Unsupported option flags are stored in KNOWN_UNSUPPORTED_REGEX_STR_OPTIONS
+    public static var ALLOW_KNOWN_UNSUPPORTED_REGX_STR_OPTIONS: Bool = false
+    /// List of known option flags that are unsupported
+    public static var KNOWN_UNSUPPORTED_REGEX_STR_OPTIONS: [Character] = ["g", "u", "y"]
+    
     fileprivate var nsRegex: NSRegularExpression
     private let _capturedGroups: [String: [Int]]
     
@@ -288,35 +336,108 @@ public class RegEx: NSObject, ExpressibleByStringLiteral {
     /// Returns an array of the unique capture group names
     public var captureGroupNames: [String] { return Array<String>(self._capturedGroups.keys).sorted() }
     
+    /// Parsed Option Flags
+    private let parsedOptionFlags: String?
     
+    /// String representing the regular expression including option flags if any were set
+    public var string: String {
+        let optionStr: String = self.parsedOptionFlags ?? self.options.flagString
+        
+        var string = self.pattern
+        if !optionStr.isEmpty {
+            string = "/" + string + "/" + optionStr
+        }
+        
+        return string
+    }
+    
+    private init(pattern: String, options: RegEx.Options = [], parsedOptionFlags: String?) throws {
+        self.options = options
+        self.pattern = pattern
+        self.parsedOptionFlags = parsedOptionFlags
+        
+        self.nsRegex = try NSRegularExpression(pattern: pattern, options: options.nsValue)
+        self._capturedGroups = PatternGroupParser(pattern).namedGroups
+        super.init()
+    }
     /// Returns an initialized RegEx instance with the specified regular expression pattern and options.
     ///
     /// - Parameter pattern The regular expression pattern to compile.
     /// - Parameter options The regular expression options that are applied to the expression during matching. See RegEx.Options for possible values.
     ///
     /// - Returns: An instance of RegEx for the specified regular expression and options.
-    public init(pattern: String, options: RegEx.Options = []) throws {
-        self.options = options
-        self.pattern = pattern
+    public convenience init(pattern: String, options: RegEx.Options = []) throws {
+        try self.init(pattern:  pattern, options: options, parsedOptionFlags: nil)
+    }
+    
+    /// Create a new regular expression object from its string representation
+    /// - Parameter string: The string representing the regular expression object
+    /// - Throws: Throws error on invalid string
+    public convenience init(_ string: String) throws {
+        var pattern = string
+        var options = RegEx.Options()
+        var parsedOptionFlags: String? = nil
+        if pattern.hasPrefix("/"),
+           let r = pattern.range(of: "/", options: [.backwards, .literal]),
+           r.lowerBound != pattern.startIndex {
+            
+            let indexOfLastSlash = r.lowerBound
+            //let indexAfterLastSlash = r.upperBound
         
-        nsRegex = try NSRegularExpression(pattern: pattern, options: options.nsValue)
-        self._capturedGroups = PatternGroupParser(pattern).namedGroups
-        super.init()
+            //let indexOfLastSlash = indexOfLastSlash
+            let indexAfterLastSlash = pattern.index(after: indexOfLastSlash)
+
+           
+            // Grab pattern options
+            let optionStr = String(pattern.suffix(from: indexAfterLastSlash))
+           
+            // Remove options from pattern
+            pattern = String(pattern.prefix(upTo: indexOfLastSlash))
+            
+            // Remove beginning slash
+            pattern.removeFirst()
+           
+           var invalidOptions: String = ""
+           for option in optionStr {
+                if let opt = Options(option) {
+                    options.insert(opt)
+                    if parsedOptionFlags == nil { parsedOptionFlags = "" }
+                    parsedOptionFlags! += String(option)
+                } else if RegEx.ALLOW_KNOWN_UNSUPPORTED_REGX_STR_OPTIONS && RegEx.KNOWN_UNSUPPORTED_REGEX_STR_OPTIONS.contains(option) {
+                     if parsedOptionFlags == nil { parsedOptionFlags = "" }
+                    parsedOptionFlags! += String(option)
+                } else {
+                    invalidOptions += String(option)
+                }
+           }
+           if !invalidOptions.isEmpty {
+               throw Errors.parsedInvalidOptionFlags(invalidOptions)
+           }
+        }
+       
+        try self.init(pattern: pattern, options: options, parsedOptionFlags: parsedOptionFlags)
     }
     
     /// This constructor allows for converting from string literal.  Will cause a fatal error if the string is not a valid regular expression string
     public required convenience init(stringLiteral value: String) {
-        do { try self.init(pattern: value) }
+        do { try self.init(value) }
         catch { fatalError("\(error)") }
     }
 
+    public convenience init(from decoder: Decoder) throws {
+        let pattern = try decoder.singleValueContainer().decode(String.self)
+        
+        try self.init(pattern)
+    }
+    
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(self.string)
+        
+    }
     
     private func nsRange(_ string: String, from range: @autoclosure () -> Range<String.Index>?) -> NSRange {
         return NSRange(range() ?? string._regExFullRange, in: string)
-        /*let range = code() ?? string._regExFullRange
-        let distance = string.distance(from: string.startIndex, to: range.lowerBound)
-        let count = string.distance(from: range.lowerBound, to: range.upperBound)
-        return NSRange(location: distance, length: count)*/
     }
     
     
@@ -422,6 +543,13 @@ public class RegEx: NSObject, ExpressibleByStringLiteral {
                                                      range: self.nsRange(string, from: range))
         
         return Range<String.Index>(nsRange, in: string)
+    }
+    
+    public override func isEqual(_ object: Any?) -> Bool {
+        guard let rhs = object as? RegEx else { return false }
+        return (self.pattern == rhs.pattern &&
+                self.options == rhs.options &&
+                self.parsedOptionFlags == rhs.parsedOptionFlags )
     }
     
 }
